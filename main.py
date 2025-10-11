@@ -1,3 +1,4 @@
+import os
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -169,14 +170,31 @@ async def more_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("free", free_cmd))
-    app.add_handler(CommandHandler("more", more_cmd))  # ← вот сюда добавь
+    app.add_handler(CommandHandler("more", more_cmd))
     app.add_handler(CallbackQueryHandler(on_cb))
     app.add_handler(MessageHandler(filters.COMMAND, start))
-    app.run_polling()
+
+    # --- режим запуска ---
+    base_url = os.getenv("BASE_URL", "").strip()      # https://...onrender.com
+    port = int(os.getenv("PORT", "10000"))            # Render задаёт PORT
+
+    if base_url:
+        # Webhook-режим для Render (Web Service обязан слушать порт)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=TELEGRAM_TOKEN,                   # скрытый путь
+            webhook_url=f"{base_url}/{TELEGRAM_TOKEN}",
+        )
+    else:
+        # Локально можно оставлять polling
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
