@@ -6,6 +6,7 @@ from config import TELEGRAM_TOKEN, GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, DEF
 from google_sheets import append_inbox, fetch_ops_tasks, fetch_kpi, fetch_eff_actions
 from logic import parse_due, pick_next
 from gpt_brain import gpt_analyze_free, gpt_analyze_status, gpt_continue_status
+from calendar_api import add_event
 logging.basicConfig(level=logging.INFO)
 HELP = ("Команды:\n"
         "/start — запуск\n"
@@ -125,18 +126,35 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ttl = f"{t.get('Категория','?')} — {t.get('Проект','?')}: {t.get('Задача','?')}"
 
         append_inbox(
-            GOOGLE_SHEET_ID,
-            GOOGLE_CREDENTIALS_JSON,
-            f"[СПРИНТ {duration} мин] {ttl}",
-            category="Собрание",
-            due_str="завтра",
-            author=DEFAULT_AUTHOR
-        )
+    GOOGLE_SHEET_ID,
+    GOOGLE_CREDENTIALS_JSON,
+    f"[СПРИНТ {duration} мин] {ttl}",
+    category="Собрание",
+    due_str="завтра",
+    author=DEFAULT_AUTHOR
+)
 
-        await q.edit_message_text(
-            f"🧭 Добавил запрос: {duration} мин фокус на задачу.\nСлот появится завтра в 06:00 в календаре."
-        )
-        return
+# ➜ создаём событие в календаре (по умолчанию — завтра 06:00 в TZ из ENV)
+try:
+    created = add_event(
+        summary=f"[СПРИНТ {duration} мин] {ttl}",
+        minutes=duration,
+        start_dt=None,  # None => завтра 06:00
+        description="Автозапись из VP Assistant (/free)"
+    )
+    link = created.get("htmlLink", "—")
+    await q.edit_message_text(
+        f"🧭 Запланировал спринт: {duration} мин.\n"
+        f"Старт: завтра 06:00 ({os.getenv('TZ', 'Europe/Berlin')}).\n"
+        f"Календарь: {link}"
+    )
+except Exception as e:
+    await q.edit_message_text(
+        "🧭 Спринт внесён в список дел, но событие в календарь не создалось.\n"
+        f"Причина: {e}"
+    )
+return
+
 
     # --- обработка кнопки «Продолжить ⏭» ---
     elif q.data == "MORE::status":
