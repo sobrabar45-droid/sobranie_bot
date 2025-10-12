@@ -1,4 +1,4 @@
-import os, json, base64
+import os, json, base64, datetime
 from google.oauth2.service_account import Credentials
 import gspread
 
@@ -43,6 +43,7 @@ def _open(sheet_id: str, creds_src: str):
 
     gc = gspread.authorize(creds)
     return gc.open_by_key(sheet_id)
+
 def append_inbox(sheet_id, creds_path, text, category="", due_str="", author="В.П."):
     sh = _open(sheet_id, creds_path)
     ws = sh.worksheet(SHEET_INBOX)
@@ -61,6 +62,7 @@ def fetch_ops_tasks(sheet_id, creds_path, limit=50):
     sh = _open(sheet_id, creds_path)
     ws = sh.worksheet(SHEET_OPS)
     recs = ws.get_all_records()
+    # фильтруем только «активные»
     recs = [r for r in recs if str(r.get("Статус","")).lower() in ("в работе","не начато","ожидание","новая")]
     def to_date(s):
         try: return dt.datetime.strptime(str(s), "%Y-%m-%d").date()
