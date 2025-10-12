@@ -85,3 +85,45 @@ def gpt_continue_status(original_prompt: str, so_far: str):
         return resp.choices[0].message.content.strip() if resp.choices else "Нет продолжения."
     except Exception as e:
         return f"Не удалось продолжить: {e}"
+from openai import OpenAI
+__gpt_client = None
+def _gpt():
+    global __gpt_client
+    if __gpt_client is None:
+        __gpt_client = OpenAI()
+    return __gpt_client
+
+def gpt_prioritize(inbox_rows):
+    tasks_text = "\n".join([f"- [{r.get('Категория','?')}] {r.get('Текст','?')} (срок: {r.get('Срок','—')})"
+                            for r in inbox_rows[:30]])
+    prompt = f"""Ты — личный ассистент. Расставь приоритеты очень кратко:
+1) Топ-5 срочно/важно — по пунктам.
+2) Что делегировать?
+3) Что убрать/перенести?
+Список задач:
+{tasks_text}"""
+    r = _gpt().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.3, max_tokens=500
+    )
+    return r.choices[0].message.content.strip()
+
+def gpt_daily_review(day_text, risks_text):
+    prompt = f"Сформулируй понятный план дня по событиям:\n{day_text}\nРиски: {risks_text}\nВывод и 3 шага фокуса."
+    r = _gpt().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.3, max_tokens=400
+    )
+    return r.choices[0].message.content.strip()
+
+def gpt_weekly_review(week_text, goals_hint=""):
+    prompt = f"Краткий недельный обзор:\n{week_text}\n{goals_hint}\nПики нагрузки, свободные окна, 5 главных задач."
+    r = _gpt().chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.3, max_tokens=600
+    )
+    return r.choices[0].message.content.strip()
+

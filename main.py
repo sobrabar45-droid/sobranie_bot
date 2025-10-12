@@ -2,6 +2,8 @@ import os
 import logging
 import urllib.parse
 import datetime as dt
+from datetime import datetime, timedelta
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -9,6 +11,8 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from telegram.constants import ChatAction
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,11 +22,21 @@ from telegram.ext import (
     filters,
 )
 
+import aiohttp, io
+import pytz
+
 from config import TELEGRAM_TOKEN, GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, DEFAULT_AUTHOR, TZ
 from google_sheets import append_inbox, fetch_ops_tasks, fetch_kpi, fetch_eff_actions
 from logic import parse_due, pick_next
-from gpt_brain import gpt_analyze_free, gpt_analyze_status, gpt_continue_status
-from calendar_api import add_event
+from gpt_brain import (
+    gpt_analyze_free,
+    gpt_analyze_status,
+    gpt_continue_status,
+    gpt_prioritize,
+    gpt_daily_review,
+    gpt_weekly_review,
+)
+from calendar_api import list_events_between, pretty_events, add_event
 
 logging.basicConfig(level=logging.INFO)
 
@@ -37,21 +51,25 @@ BTN_KPI       = "📈 Статус KPI"
 BTN_MENU      = "Меню"
 
 MAIN_KB = ReplyKeyboardMarkup(
-    [[KeyboardButton(BTN_CAPTURE), KeyboardButton(BTN_TODAY), KeyboardButton(BTN_WEEK)],
-     [KeyboardButton(BTN_MONTH), KeyboardButton(BTN_CALENDAR), KeyboardButton(BTN_FOCUS)],
-     [KeyboardButton(BTN_KPI)]],
+    [
+        [KeyboardButton(BTN_CAPTURE), KeyboardButton(BTN_TODAY), KeyboardButton(BTN_WEEK)],
+        [KeyboardButton(BTN_MONTH), KeyboardButton(BTN_CALENDAR), KeyboardButton(BTN_FOCUS)],
+        [KeyboardButton(BTN_KPI)],
+    ],
     resize_keyboard=True
 )
 
 # Флаг режима «жду следующего текста как задачу»
 AWAITING_CAPTURE_FLAG = "awaiting_capture"
 
-HELP = ("Кнопки доступны внизу. Могу:\n"
-        f"• {BTN_CAPTURE} — быстро записать задачу (без /add)\n"
-        f"• {BTN_TODAY}/{BTN_WEEK}/{BTN_MONTH} — список дел с приоритетом\n"
-        f"• {BTN_CALENDAR} — ссылка и быстрые слоты\n"
-        f"• {BTN_FOCUS} — рекомендованные 2–3 задачи и спринты\n"
-        f"• {BTN_KPI} — короткий отчёт по KPI\n")
+HELP = (
+    "Кнопки доступны внизу. Могу:\n"
+    f"• {BTN_CAPTURE} — быстро записать задачу (без /add)\n"
+    f"• {BTN_TODAY}/{BTN_WEEK}/{BTN_MONTH} — список дел с приоритетом\n"
+    f"• {BTN_CALENDAR} — ссылка и быстрые слоты\n"
+    f"• {BTN_FOCUS} — рекомендованные 2–3 задачи и спринты\n"
+    f"• {BTN_KPI} — короткий отчёт по KPI\n"
+)
 
 # ====== ВСПОМОГАТЕЛЬНОЕ ======
 def detect_category(t: str):
@@ -75,8 +93,6 @@ def format_tasks(tasks):
     return "\n".join(lines) if lines else "Список пуст."
 
 def telegram_calendar_link(calendar_id: str) -> str:
-    # Показываем пользователю открытие своего календаря с добавленным источником
-    # (этот линк не «секретный»)
     cid = urllib.parse.quote(calendar_id, safe='')
     return f"https://calendar.google.com/calendar/u/0/r?cid={cid}"
 
@@ -91,7 +107,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_capture_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[AWAITING_CAPTURE_FLAG] = True
     await update.message.reply_text(
-        "Окей, пришли текст задачи одной строкой. Примеры:\n"
+        "📝 Внесение: пришли текст одной строкой. Примеры:\n"
         "— купить картошки завтра #семья\n"
         "— позвонить поставщику кофе через 2 д #собрание",
         reply_markup=MAIN_KB
@@ -118,11 +134,11 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ok = append_inbox(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, text, category=cat, due_str=due, author=DEFAULT_AUTHOR)
         if ok:
             await update.message.reply_text(
-                f"Записал в Inbox → [{cat}] {text}\nСрок: {due or '—'}",
+                f"✅ Записал: [{cat}] {text}\nСрок: {due or '—'}",
                 reply_markup=MAIN_KB
             )
         else:
-            await update.message.reply_text("Не удалось записать (проверь доступы).", reply_markup=MAIN_KB)
+            await update.message.reply_text("⚠️ Не удалось записать (проверь доступы).", reply_markup=MAIN_KB)
         return
 
     # Иначе — позволим печатать «Меню» текстом
@@ -171,21 +187,19 @@ def _period_dates(which: str):
     if which == "week":
         return today, today + dt.timedelta(days=7)
     if which == "month":
-        # 30 календарных дней вперёд
         return today, today + dt.timedelta(days=30)
     return today, today
 
 async def _send_period(update: Update, context: ContextTypes.DEFAULT_TYPE, which: str):
     start, end = _period_dates(which)
-    # Берём операционные задачи (вкладка 02_Operations_Sobranie)
     tasks = fetch_ops_tasks(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, 300)
 
-    # Фильтруем по дедлайну в интервале
     def to_date(s):
         try:
             return dt.datetime.strptime(str(s), "%Y-%m-%d").date()
         except:
             return None
+
     in_range = []
     for t in tasks:
         d = to_date(t.get("Дедлайн",""))
@@ -194,7 +208,6 @@ async def _send_period(update: Update, context: ContextTypes.DEFAULT_TYPE, which
         if start <= d <= end:
             in_range.append(t)
 
-    # Отсортируем по дате
     in_range.sort(key=lambda t: t.get("Дедлайн",""))
     text = f"📋 {('Сегодня' if which=='today' else '7 дней' if which=='week' else '30 дней')}:\n" + format_tasks(in_range)
     await update.message.reply_text(text, reply_markup=MAIN_KB)
@@ -218,7 +231,6 @@ async def focus_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["free_top"] = top
-    # Кнопки спринта
     buttons, lines = [], []
     for i, t in enumerate(top, 1):
         ttl = f"{t.get('Категория','?')} — {t.get('Проект','?')}: {t.get('Задача','?')}"
@@ -362,15 +374,15 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not due and "через" in text: due = text
     due = parse_due(due)
     ok = append_inbox(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, text, category=cat, due_str=due, author=DEFAULT_AUTHOR)
-    await update.message.reply_text(f"Записал в Inbox → [{cat}] {text}\nСрок: {due or '—'}" if ok else "Не удалось записать (проверь доступы).",
-                                    reply_markup=MAIN_KB)
+    await update.message.reply_text(
+        f"Записал в Inbox → [{cat}] {text}\nСрок: {due or '—'}" if ok else "Не удалось записать (проверь доступы).",
+        reply_markup=MAIN_KB
+    )
 
 async def free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # переиспользуем «Фокус»
     await focus_button(update, context)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # переиспользуем кнопку KPI
     await kpi_button(update, context)
 
 def main():
