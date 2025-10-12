@@ -113,6 +113,7 @@ async def handle_capture_button(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=MAIN_KB
     )
 
+# ====== ТЕКСТ (в т.ч. режим «внести») ======
 async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
@@ -151,6 +152,54 @@ async def handle_any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Если хочешь быстро записать — нажми «Внести». Остальные функции — на кнопках ниже.",
         reply_markup=MAIN_KB
     )
+
+# ====== ГОЛОС (распознавание и запись в Inbox) ======
+async def handle_voice_in_capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Всегда воспринимаем голос как «внести» (без необходимости нажимать кнопку)
+    context.user_data[AWAITING_CAPTURE_FLAG] = True
+
+    voice = update.message.voice or update.message.audio
+    if not voice:
+        return False
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    # скачиваем файл из Telegram
+    file = await context.bot.get_file(voice.file_id)
+    async with aiohttp.ClientSession() as s:
+        async with s.get(file.file_path) as resp:
+            data = await resp.read()
+
+    # Whisper (OpenAI)
+    from openai import OpenAI
+    client = OpenAI()
+    audio = io.BytesIO(data); audio.name = "audio.ogg"
+    try:
+        text = client.audio.transcriptions.create(
+            model="whisper-1", file=audio, response_format="text", language="ru"
+        ).strip()
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Не удалось распознать голос: {e}", reply_markup=MAIN_KB)
+        context.user_data[AWAITING_CAPTURE_FLAG] = False
+        return True
+
+    # Дальше — как с обычным текстом
+    cat = detect_category(text)
+    due = ""
+    for kw in ["сегодня","завтра","послезавтра"]:
+        if kw in text.lower():
+            due = kw
+            break
+    if not due and "через" in text:
+        due = text
+    due = parse_due(due)
+
+    ok = append_inbox(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, text, category=cat, due_str=due, author=DEFAULT_AUTHOR)
+    msg = f"🎤 Текст: «{escape_markdown(text, version=2)}»\n" + ("✅ Записал." if ok else "⚠️ Не удалось записать.")
+    await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=MAIN_KB)
+
+    context.user_data[AWAITING_CAPTURE_FLAG] = False
+    return True
 
 # ====== KPI ======
 async def kpi_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -361,7 +410,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"🤖 Продолжение:\n{cont}")
         return
 
-# ====== РЕЗЕРВНЫЕ /КОМАНДЫ (оставляем, но пользователю не нужны) ======
+# ====== РЕЗЕРВНЫЕ /КОМАНДЫ ======
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").replace("/add","",1).strip()
     if not text:
@@ -404,6 +453,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_FOCUS}$"), focus_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_KPI}$"), kpi_button))
 
+    # Голос обязательно регистрируем ДО общего текстового хендлера
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_in_capture))
     # Режим «жду текст после 'Внести'»
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_any_text))
     # Неподдерживаемые команды — показываем меню
