@@ -13,4 +13,6 @@ google-api-python-client
 pytz
 aiohttp
 python-dateutil
+google-cloud-speech
+google-auth
 
