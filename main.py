@@ -1,5 +1,6 @@
 import os
 import logging
+import datetime as dt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -9,6 +10,7 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler,
 )
+
 from gpt_brain import gpt_analyze_status, gpt_continue_status
 from google_sheets import fetch_kpi, append_inbox
 from calendar_api import list_events_between, pretty_events, add_event
@@ -21,11 +23,30 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 AUTHOR_NAME = os.getenv("AUTHOR_NAME", "В.П.")
 BASE_URL = os.getenv("BASE_URL", "https://sobranie-bot.onrender.com")
 CALENDAR_ID = os.getenv("CALENDAR_ID", "").strip()
+TZ = os.getenv("TZ", "Europe/Berlin")
 
 logging.basicConfig(level=logging.INFO)
 
-# === КОМАНДЫ ===
 
+# --- Глобальный перехватчик ошибок: стек в логи, пользователю — короткое сообщение
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    import traceback
+    err = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    logging.error("❌ Unhandled error:\n%s", err)
+    try:
+        chat_id = None
+        if isinstance(update, Update):
+            if update.effective_chat:
+                chat_id = update.effective_chat.id
+            elif update.callback_query and update.callback_query.message:
+                chat_id = update.callback_query.message.chat_id
+        if chat_id:
+            await context.bot.sendMessage(chat_id, "⚠️ Внутренняя ошибка. Подробности в логах Render.")
+    except Exception:
+        pass
+
+
+# === КОМАНДЫ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📊 Статус", callback_data="status")],
@@ -35,15 +56,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🗓️ Месяц", callback_data="month"),
         ],
         [InlineKeyboardButton("➕ Внести задачу", callback_data="capture")],
-        [InlineKeyboardButton("📎 Календарь", url="https://calendar.google.com")],
+        [InlineKeyboardButton("🔗 Календарь (веб)", url="https://calendar.google.com")],
+        [InlineKeyboardButton("🧪 Диагностика", callback_data="diag")],
     ]
     await update.message.reply_text(
-        "👋 Добро пожаловать! Выберите действие:", 
-        reply_markup=InlineKeyboardMarkup(kb)
+        "👋 Добро пожаловать! Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(kb),
     )
 
-# === СТАТУС / KPI ===
 
+# === СТАТУС / KPI ===
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Анализирую показатели...")
     kpi = fetch_kpi(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON)
@@ -60,29 +82,91 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Продолжить", callback_data="MORE::status")]])
     await update.message.reply_text(f"🤖 Анализ:\n{comment}", reply_markup=kb)
 
-# === ОБРАБОТКА НАЖАТИЙ ===
 
+# === САМО-ДИАГНОСТИКА ===
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timedelta
+    calendar_id = CALENDAR_ID
+    creds_raw = GOOGLE_CREDENTIALS_JSON
+    tz = TZ
+    y_key = os.getenv("YANDEX_API_KEY", "")
+    y_folder = os.getenv("YANDEX_FOLDER_ID", "")
+    base_url = BASE_URL
+    oai = os.getenv("OPENAI_API_KEY", "")
+
+    # тип creds: путь/встроенный JSON
+    if not creds_raw:
+        creds_kind = "❌ пусто"
+    elif os.path.exists(creds_raw):
+        creds_kind = f"📁 путь к файлу (найден): {creds_raw}"
+    else:
+        import json
+        try:
+            _ = json.loads(creds_raw)
+            creds_kind = "📄 встроенный JSON (OK)"
+        except Exception as e:
+            creds_kind = f"⚠️ встроенный JSON, но парсинг не удался: {e}"
+
+    # пробуем прочитать 3 события
+    cal_probe = ""
+    try:
+        if not calendar_id:
+            cal_probe = "❌ CALENDAR_ID не задан"
+        else:
+            now = datetime.utcnow()
+            events = list_events_between(calendar_id, creds_raw, now, now + timedelta(days=3), max_results=3)
+            if not events:
+                cal_probe = "✅ Календарь читается, событий нет."
+            else:
+                cal_probe = "✅ Календарь читается. Ближайшие события:\n" + pretty_events(events)
+    except Exception as e:
+        cal_probe = f"❌ Ошибка чтения календаря: {e}"
+
+    stt_probe = []
+    stt_probe.append("Yandex SpeechKit: " + ("✅ ключ задан" if y_key and y_folder else "❌ нет ключа/FolderID"))
+    stt_probe.append("OpenAI: " + ("✅ ключ задан" if oai else "— (не используется)"))
+
+    msg = (
+        "🧪 DIAG:\n"
+        f"• CALENDAR_ID: {calendar_id or '—'}\n"
+        f"• GOOGLE_CREDENTIALS_JSON: {creds_kind}\n"
+        f"• TZ: {tz}\n"
+        f"• BASE_URL: {base_url or '—'}\n"
+        f"• STТ: {', '.join(stt_probe)}\n\n"
+        f"{cal_probe}"
+    )
+    await update.message.reply_text(msg)
+
+
+# === ОБРАБОТКА НАЖАТИЙ ===
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data.split("::")
+    raw = q.data
+    data = raw.split("::")
 
-    # --- Кнопки периодов: День / Неделя / Месяц ---
-    if q.data in ["day", "week", "month"]:
-        from datetime import datetime, timedelta
-        now = datetime.utcnow()
-        if q.data == "day":
-            end = now + timedelta(days=1)
+    # --- Диагностика кнопкой
+    if raw == "diag":
+        # «проксируем» на /diag, чтобы логика была одна
+        fake_update = Update(update.update_id, message=q.message)
+        await diag_cmd(fake_update, context)
+        return
+
+    # --- Список событий (день / неделя / месяц)
+    if raw in ["day", "week", "month"]:
+        now = dt.datetime.utcnow()
+        if raw == "day":
+            end = now + dt.timedelta(days=1)
             title = "🗓 На сегодня"
-        elif q.data == "week":
-            end = now + timedelta(days=7)
+        elif raw == "week":
+            end = now + dt.timedelta(days=7)
             title = "📅 На 7 дней"
         else:
-            end = now + timedelta(days=30)
+            end = now + dt.timedelta(days=30)
             title = "🗓️ На 30 дней"
 
         if not CALENDAR_ID:
-            await q.edit_message_text("CALENDAR_ID не задан в переменных окружения.", reply_markup=None)
+            await q.edit_message_text("❌ CALENDAR_ID не задан в переменных окружения.", reply_markup=None)
             return
 
         try:
@@ -94,7 +178,25 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"Не удалось получить события календаря: {e}", reply_markup=None)
         return
 
-    # --- обработка кнопок спринтов (из «Фокус») ---
+    # --- обработка кнопки «Внести задачу»
+    if raw == "capture":
+        await q.edit_message_text("📝 Напишите задачу (например: «купить картошку #семья завтра»):")
+        context.user_data["capture_mode"] = True
+        return
+
+    # --- обработка кнопки «Продолжить ⏭» после KPI
+    if raw == "MORE::status":
+        prompt = context.user_data.get("last_status_prompt", "")
+        so_far = context.user_data.get("last_status_text", "")
+        if not prompt or not so_far:
+            await q.message.reply_text("Нечего продолжать. Сначала нажми «📊 Статус».")
+            return
+        cont = gpt_continue_status(prompt, so_far)
+        context.user_data["last_status_text"] = so_far + "\n" + cont
+        await q.message.reply_text(f"🤖 Продолжение:\n{cont}")
+        return
+
+    # --- обработка спринтов (если будут кнопки POM::dur::idx)
     if len(data) >= 3 and data[0] == "POM":
         try:
             duration = int(data[1])
@@ -118,20 +220,20 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"[СПРИНТ {duration} мин] {ttl}",
             category="Собрание",
             due_str="завтра",
-            author=DEFAULT_AUTHOR
+            author=AUTHOR_NAME,
         )
         # 2) создаём событие завтра 06:00 по TZ
         try:
             created = add_event(
                 summary=f"[СПРИНТ {duration} мин] {ttl}",
                 minutes=duration,
-                start_dt=None,  # завтра 06:00
-                description="Автозапись из VP Assistant (🎯 Фокус)"
+                start_dt=None,  # завтра 06:00 (см. calendar_api.add_event)
+                description="Автозапись из VP Assistant (🎯 Фокус)",
             )
             link = created.get("htmlLink", "—")
             await q.edit_message_text(
                 f"🧭 Запланировал спринт: {duration} мин.\n"
-                f"Старт: завтра 06:00 ({os.getenv('TZ', 'Europe/Berlin')}).\n"
+                f"Старт: завтра 06:00 ({TZ}).\n"
                 f"Календарь: {link}"
             )
         except Exception as e:
@@ -141,33 +243,31 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # --- обработка кнопок календаря (быстрые пресеты) ---
+    # --- обработка быстрых пресетов календаря (если будут CAL::PRESET::DUR)
     if len(data) >= 3 and data[0] == "CAL":
         preset = data[1]
         try:
             duration = int(data[2])
-        except:
+        except Exception:
             duration = 60
 
-        from dateutil import tz as _tz
-        local = _tz.gettz(TZ or "Europe/Berlin")
-        now = dt.datetime.now(local)
-
+        now_local = dt.datetime.now()
+        # делаем start_dt «наивным» — calendar_api сам подставит TZ
         if preset == "TODAY19":
-            start_dt = now.replace(hour=19, minute=0, second=0, microsecond=0)
-            if start_dt < now:
+            start_dt = now_local.replace(hour=19, minute=0, second=0, microsecond=0)
+            if start_dt < now_local:
                 start_dt = start_dt + dt.timedelta(days=1)
         elif preset == "TOMORROW06":
-            start_dt = (now + dt.timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
+            start_dt = (now_local + dt.timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
         else:
-            start_dt = (now + dt.timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
+            start_dt = (now_local + dt.timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
 
         try:
             created = add_event(
                 summary=f"[Слот {duration} мин] Фокус-набор",
                 minutes=duration,
                 start_dt=start_dt,
-                description="Быстрый слот (Календарь)"
+                description="Быстрый слот (Календарь)",
             )
             link = created.get("htmlLink", "—")
             when = start_dt.strftime("%Y-%m-%d %H:%M")
@@ -176,38 +276,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"Не удалось создать слот: {e}")
         return
 
-    # --- обработка кнопки «Продолжить ⏭» после KPI ---
-    if q.data == "MORE::status":
-        prompt = context.user_data.get("last_status_prompt", "")
-        so_far = context.user_data.get("last_status_text", "")
-        if not prompt or not so_far:
-            await q.message.reply_text("Нечего продолжать. Сначала нажми «📈 Статус KPI».")
-            return
-        cont = gpt_continue_status(prompt, so_far)
-        context.user_data["last_status_text"] = so_far + "\n" + cont
-        await q.message.reply_text(f"🤖 Продолжение:\n{cont}")
-        return
-
-    # --- Кнопка «Внести задачу» ---
-    if data == "capture":
-        await q.edit_message_text("📝 Напишите задачу (например: «купить картошку #семья завтра»):")
-        context.user_data["capture_mode"] = True
-        return
-
-    # --- Продолжение анализа ---
-    if data == "MORE::status":
-        prompt = context.user_data.get("last_status_prompt", "")
-        so_far = context.user_data.get("last_status_text", "")
-        if not prompt or not so_far:
-            await q.message.reply_text("Нет данных для продолжения. Сначала запустите /status.")
-            return
-        cont = gpt_continue_status(prompt, so_far)
-        context.user_data["last_status_text"] = so_far + "\n" + cont
-        await q.message.reply_text(f"🤖 Продолжение:\n{cont}")
-        return
 
 # === ДОБАВЛЕНИЕ ТЕКСТА ===
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("capture_mode"):
         context.user_data["capture_mode"] = False
@@ -217,8 +287,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("💬 Используйте кнопки меню для выбора действия.")
 
-# === ОБРАБОТКА ГОЛОСА ===
 
+# === ОБРАБОТКА ГОЛОСА ===
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
@@ -233,23 +303,34 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     append_inbox(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, text, author=AUTHOR_NAME)
     await update.message.reply_text(f"🗣 Распознал и добавил:\n{text}")
 
-# === ГЛАВНАЯ ФУНКЦИЯ ===
 
+# === ГЛАВНАЯ ФУНКЦИЯ ===
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("diag", diag_cmd))
+
+    # кнопки/колбэки
     app.add_handler(CallbackQueryHandler(on_cb))
+
+    # сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # --- Webhook для Render ---
+    # глобальный обработчик ошибок
+    app.add_error_handler(error_handler)
+
+    # Webhook для Render
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 8080)),
         url_path=TELEGRAM_TOKEN,
         webhook_url=f"{BASE_URL}/{TELEGRAM_TOKEN}",
     )
+
 
 if __name__ == "__main__":
     main()
