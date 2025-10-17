@@ -2,6 +2,7 @@ import os
 import logging
 import datetime as dt
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,6 +25,30 @@ AUTHOR_NAME = os.getenv("AUTHOR_NAME", "В.П.")
 BASE_URL = os.getenv("BASE_URL", "https://sobranie-bot.onrender.com")
 CALENDAR_ID = os.getenv("CALENDAR_ID", "").strip()
 TZ = os.getenv("TZ", "Europe/Berlin")
+def render_menu_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статус", callback_data="status")],
+        [
+            InlineKeyboardButton("📅 Сегодня", callback_data="day"),
+            InlineKeyboardButton("🗓 Неделя", callback_data="week"),
+            InlineKeyboardButton("🗓️ Месяц", callback_data="month"),
+        ],
+        [InlineKeyboardButton("➕ Внести", callback_data="capture")],
+        [InlineKeyboardButton("🧪 Диагностика", callback_data="diag")],
+        [InlineKeyboardButton("🔗 Календарь (веб)", url="https://calendar.google.com")],
+    ])
+
+def render_menu_reply() -> ReplyKeyboardMarkup:
+    # Обычная (reply) клавиатура — на случай, если клиент присылает текст вместо callback
+    return ReplyKeyboardMarkup(
+        [
+            ["📅 Сегодня", "🗓 Неделя", "🗓️ Месяц"],
+            ["📊 Статус", "🧪 Диагностика"],
+            ["➕ Внести"],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
 
 logging.basicConfig(level=logging.INFO)
 
@@ -48,22 +73,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # === КОМАНДЫ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("📊 Статус", callback_data="status")],
-        [
-            InlineKeyboardButton("🗓 День", callback_data="day"),
-            InlineKeyboardButton("📅 Неделя", callback_data="week"),
-            InlineKeyboardButton("🗓️ Месяц", callback_data="month"),
-        ],
-        [InlineKeyboardButton("➕ Внести задачу", callback_data="capture")],
-        [InlineKeyboardButton("🔗 Календарь (веб)", url="https://calendar.google.com")],
-        [InlineKeyboardButton("🧪 Диагностика", callback_data="diag")],
-    ]
     await update.message.reply_text(
         "👋 Добро пожаловать! Выберите действие:",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=render_menu_reply(),  # показываем reply-клавиатуру
     )
-
+    # и сразу кидаем inline-меню (кнопки с callback)
+    await update.message.reply_text("Меню (inline):", reply_markup=render_menu_inline())
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # reply-клавиатура (нижняя большая)
+    await update.message.reply_text("🧭 Меню:", reply_markup=render_menu_reply())
+    # дубль inline-меню (кнопки с callback)
+    await update.message.reply_text("Меню (inline):", reply_markup=render_menu_inline())
 
 # === СТАТУС / KPI ===
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +338,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
 
     # кнопки/колбэки
     app.add_handler(CallbackQueryHandler(on_cb))
