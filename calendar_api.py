@@ -1,91 +1,168 @@
 import os
-from datetime import datetime, timedelta
+import json
+import datetime as dt
 from typing import List, Dict, Optional
 
-import pytz
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from dateutil import tz as _tz
+
+# Читаем дефолты из окружения (можно переопределять аргументами функций)
+CALENDAR_ID = os.getenv("CALENDAR_ID", "").strip()
+CREDS_INPUT = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+TZ = os.getenv("TZ", "Europe/Berlin")
 
 
-# ---------- внутреннее: подключение к Google Calendar ----------
-def _service(creds_path: str):
+def _load_credentials(creds_input: str) -> Credentials:
+    """
+    Принимает либо путь к JSON-файлу сервис-аккаунта,
+    либо «цельный» JSON-текст (как в Render Environment).
+    Возвращает объект Credentials.
+    """
     scopes = ["https://www.googleapis.com/auth/calendar"]
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    if not creds_input:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON is empty")
+
+    # Если это путь к существующему файлу — читаем с диска
+    if os.path.exists(creds_input):
+        return Credentials.from_service_account_file(creds_input, scopes=scopes)
+
+    # Иначе считаем, что это цельный JSON
+    try:
+        info = json.loads(creds_input)
+        return Credentials.from_service_account_info(info, scopes=scopes)
+    except Exception as e:
+        raise RuntimeError(f"Cannot parse GOOGLE_CREDENTIALS_JSON: {e}")
+
+
+def _service(creds_input: Optional[str] = None):
+    creds = _load_credentials(creds_input or CREDS_INPUT)
     return build("calendar", "v3", credentials=creds)
 
 
-# ---------- чтение событий за интервал ----------
-def list_events_between(calendar_id: str, creds_path: str,
-                        dt_from: datetime, dt_to: datetime) -> List[Dict]:
-    svc = _service(creds_path)
-    events = svc.events().list(
-        calendarId=calendar_id,
-        timeMin=dt_from.isoformat(),
-        timeMax=dt_to.isoformat(),
-        singleEvents=True,
-        orderBy="startTime"
-    ).execute().get("items", [])
-    return events
-
-
-def pretty_events(events: List[Dict]) -> str:
-    def start_str(e):
-        st = e.get("start", {})
-        return st.get("dateTime") or st.get("date") or "?"
-    lines = []
-    for e in events:
-        lines.append(f"- {start_str(e)} — {e.get('summary', '(без названия)')}")
-    return "\n".join(lines) if lines else "—"
-
-
-# ---------- создание события ----------
-def add_event(summary: str,
-              minutes: int = 60,
-              start_dt: Optional[datetime] = None,
-              description: str = "",
-              calendar_id: Optional[str] = None,
-              creds_path: Optional[str] = None) -> Dict:
+def _to_rfc3339(dt_obj: dt.datetime) -> str:
     """
-    Создать событие в календаре.
-    - summary: заголовок
-    - minutes: длительность (мин)
-    - start_dt: datetime с tz; если None → завтра 06:00 по TZ из окружения
-    - description: описание
-    - calendar_id: по умолчанию берём из ENV CALENDAR_ID
-    - creds_path: по умолчанию берём из ENV GOOGLE_CREDENTIALS_JSON
-    Возвращает словарь созданного события (в т.ч. htmlLink).
+    Преобразует datetime → RFC3339 в UTC с Z на конце.
+    Если datetime «наивный» — считаем, что он в локальной TZ из переменной TZ.
     """
-    if calendar_id is None:
-        calendar_id = os.getenv("CALENDAR_ID", "").strip()
-    if not calendar_id:
-        raise RuntimeError("CALENDAR_ID is not set in environment")
+    if dt_obj.tzinfo is None:
+        local = _tz.gettz(TZ or "Europe/Berlin")
+        dt_obj = dt_obj.replace(tzinfo=local)
+    return dt_obj.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
-    if creds_path is None:
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-    if not creds_path:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON is not set in environment")
 
-    tz_name = os.getenv("TZ", "Europe/Berlin")
-    tz = pytz.timezone(tz_name)
+def list_events_between(
+    calendar_id: str,
+    creds_input: str,
+    dt_from: dt.datetime,
+    dt_to: dt.datetime,
+    max_results: int = 100,
+) -> List[Dict]:
+    """
+    Возвращает события календаря в интервале [dt_from, dt_to).
+    Параметры:
+      - calendar_id: ID календаря (…@group.calendar.google.com)
+      - creds_input: путь к файлу или «цельный» JSON сервис-аккаунта
+    """
+    svc = _service(creds_input)
+    time_min = _to_rfc3339(dt_from)
+    time_max = _to_rfc3339(dt_to)
 
-    # если start_dt не задан — завтра 06:00 локального TZ
+    resp = (
+        svc.events()
+        .list(
+            calendarId=calendar_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=max_results,
+        )
+        .execute()
+    )
+    return resp.get("items", [])
+
+
+def add_event(
+    summary: str,
+    minutes: int = 60,
+    start_dt: Optional[dt.datetime] = None,
+    description: str = "",
+    calendar_id: Optional[str] = None,
+    creds_input: Optional[str] = None,
+) -> Dict:
+    """
+    Создаёт событие в календаре.
+    Если start_dt не указан — создаёт завтра в 06:00 по TZ.
+    Можно передать calendar_id/creds_input; иначе берутся из ENV.
+    """
+    cid = (calendar_id or CALENDAR_ID).strip()
+    if not cid:
+        raise RuntimeError("CALENDAR_ID is not set")
+
+    svc = _service(creds_input or CREDS_INPUT)
+
+    # Старт по умолчанию — завтра 06:00 локальной TZ
+    local_tz = _tz.gettz(TZ or "Europe/Berlin")
+    now_local = dt.datetime.now(local_tz)
     if start_dt is None:
-        now = datetime.now(tz)
-        start_dt = (now + timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
+        start_dt = (now_local + dt.timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
+    elif start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=local_tz)
 
-    # убедимся, что у даты есть tzinfo
-    if start_dt.tzinfo is None:
-        start_dt = tz.localize(start_dt)
-
-    end_dt = start_dt + timedelta(minutes=minutes)
+    end_dt = start_dt + dt.timedelta(minutes=int(minutes))
 
     body = {
         "summary": summary,
-        "description": description or "",
-        "start": {"dateTime": start_dt.isoformat()},
-        "end": {"dateTime": end_dt.isoformat()},
+        "description": description,
+        "start": {
+            "dateTime": start_dt.isoformat(),
+            "timeZone": str(start_dt.tzinfo) if start_dt.tzinfo else TZ,
+        },
+        "end": {
+            "dateTime": end_dt.isoformat(),
+            "timeZone": str(end_dt.tzinfo) if end_dt.tzinfo else TZ,
+        },
     }
 
-    svc = _service(creds_path)
-    created = svc.events().insert(calendarId=calendar_id, body=body).execute()
+    created = svc.events().insert(calendarId=cid, body=body).execute()
     return created
+
+
+def pretty_events(events: List[Dict]) -> str:
+    """
+    Читабельный список событий: дата/время — заголовок (описание).
+    """
+    if not events:
+        return "—"
+
+    lines = []
+    for e in events:
+        start = e.get("start", {})
+        dt_str = start.get("dateTime") or start.get("date") or ""
+        summary = e.get("summary", "(без названия)")
+        desc = e.get("description", "")
+
+        # Укоротим описание
+        if desc:
+            desc = desc.strip().replace("\n", " ")
+            if len(desc) > 90:
+                desc = desc[:90] + "…"
+
+        # Красиво дата/время
+        try:
+            # Пытаемся распарсить dateTime
+            when = dt.datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            # в локальной TZ
+            local = when.astimezone(_tz.gettz(TZ or "Europe/Berlin"))
+            show = local.strftime("%d.%m %H:%M")
+        except Exception:
+            # Если был all-day (date без времени)
+            show = dt_str
+
+        if desc:
+            lines.append(f"• {show} — {summary} ({desc})")
+        else:
+            lines.append(f"• {show} — {summary}")
+
+    return "\n".join(lines)
