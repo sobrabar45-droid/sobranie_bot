@@ -151,6 +151,12 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fake_update = Update(update.update_id, message=q.message)
         await diag_cmd(fake_update, context)
         return
+    # --- Статус KPI по кнопке ---
+    if raw == "status":
+        # Проксируем в тот же хендлер, что и команда /status
+        fake_update = Update(update.update_id, message=q.message)
+        await status_cmd(fake_update, context)
+        return
 
     # --- Список событий (день / неделя / месяц)
     if raw in ["day", "week", "month"]:
