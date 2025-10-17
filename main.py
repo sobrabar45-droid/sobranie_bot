@@ -87,6 +87,7 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === СТАТУС / KPI ===
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("[CMD] /status")
     await update.message.reply_text("⏳ Анализирую показатели...")
     kpi = fetch_kpi(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON)
     result = gpt_analyze_status(kpi)
@@ -105,6 +106,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === САМО-ДИАГНОСТИКА ===
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info("[CMD] /diag")
     from datetime import datetime, timedelta
     calendar_id = CALENDAR_ID
     creds_raw = GOOGLE_CREDENTIALS_JSON
@@ -162,6 +164,7 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    logging.info(f"[CB] callback_data={q.data}")
     raw = q.data
     data = raw.split("::")
 
@@ -305,14 +308,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ДОБАВЛЕНИЕ ТЕКСТА ===
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ЛОГИРУЕМ полученный текст
+    logging.info(f"[TXT] text={(update.message.text or '').strip()}")
+
     if context.user_data.get("capture_mode"):
         context.user_data["capture_mode"] = False
         text = update.message.text
         append_inbox(GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_JSON, text, author=AUTHOR_NAME)
         await update.message.reply_text(f"✅ Задача добавлена:\n{text}")
         return
-    await update.message.reply_text("💬 Используйте кнопки меню для выбора действия.")
 
+    await update.message.reply_text("💬 Используйте кнопки меню для выбора действия.")
 
 # === ОБРАБОТКА ГОЛОСА ===
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
